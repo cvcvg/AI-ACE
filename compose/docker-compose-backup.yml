@@ -1,0 +1,388 @@
+services:
+
+  qwen3-text-service:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qwen3-text-service
+
+    profiles:
+      - models
+
+    command:
+      - "-m"
+      - "/models/Qwen3-4B-Q4_K_M.gguf"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+      - "--n-gpu-layers"
+      - "999"
+
+    ports:
+      - "127.0.0.1:8081:8081"
+
+    volumes:
+      - D:/AI-ACE/models/qwen3-4b:/models:ro
+
+    networks:
+      - ai-private-net
+
+    restart: "no"
+
+
+
+  deepseek-service:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: deepseek-service
+
+    profiles:
+      - models
+
+    command:
+      - "-m"
+      - "/models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8082"
+      - "--n-gpu-layers"
+      - "999"
+
+    ports:
+      - "127.0.0.1:8082:8082"
+
+    volumes:
+      - D:/AI-ACE/models/deepseek-r1-7b:/models:ro
+
+    networks:
+      - ai-private-net
+
+    restart: "no"
+
+
+
+  vision-service-model:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: vision-service-model
+
+    profiles:
+      - models
+
+    command:
+      - "-m"
+      - "/models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+
+      - "--mmproj"
+      - "/models/mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"
+
+      - "--host"
+      - "0.0.0.0"
+
+      - "--port"
+      - "8083"
+
+      - "--n-gpu-layers"
+      - "999"
+
+
+    ports:
+      - "127.0.0.1:8083:8083"
+
+
+    volumes:
+      - D:/AI-ACE/models/vision:/models:ro
+
+
+    networks:
+      - ai-private-net
+
+
+    restart: "no"
+
+
+
+
+  ace-qdrant:
+
+    image: qdrant/qdrant:latest
+
+    container_name: ace-qdrant
+
+
+    ports:
+      - "127.0.0.1:6333:6333"
+
+
+    volumes:
+      - D:/AI-ACE/knowledge/vector_db:/qdrant/storage
+
+
+    networks:
+      - ai-private-net
+
+
+    restart: unless-stopped
+
+
+
+
+  ace-document-parser:
+
+    build:
+
+      context: D:/AI-ACE/services/document-parser
+
+      dockerfile: Dockerfile
+
+
+    container_name: ace-document-parser
+
+
+    depends_on:
+
+      - ace-qdrant
+
+
+    environment:
+
+      QDRANT_HOST: ace-qdrant
+
+      QDRANT_PORT: 6333
+
+
+    ports:
+
+      - "127.0.0.1:8000:8000"
+
+
+    volumes:
+
+      - D:/AI-ACE/documents:/documents
+
+      - D:/AI-ACE/models/embedding:/models/embedding:ro
+
+      - D:/AI-ACE/knowledge:/knowledge
+
+
+    networks:
+
+      - ai-private-net
+
+
+    restart: unless-stopped
+
+
+
+
+
+  ace-rag-service:
+
+    build:
+
+      context: D:/AI-ACE/services/rag-service
+
+      dockerfile: Dockerfile
+
+
+    container_name: ace-rag-service
+
+
+    depends_on:
+
+      - ace-qdrant
+
+
+    environment:
+
+      QDRANT_HOST: ace-qdrant
+
+      QDRANT_PORT: 6333
+
+
+    ports:
+
+      - "127.0.0.1:8002:8002"
+
+
+    volumes:
+
+      - D:/AI-ACE/models/embedding:/models/embedding:ro
+
+      - D:/AI-ACE/knowledge:/knowledge
+
+
+    networks:
+
+      - ai-private-net
+
+
+    restart: unless-stopped
+
+
+
+
+
+  ace-vision-service:
+
+
+    build:
+
+      context: D:/AI-ACE/vision-service
+
+      dockerfile: Dockerfile
+
+
+    container_name: ace-vision-service
+
+
+    depends_on:
+
+      - ace-qdrant
+
+
+    environment:
+
+      VISION_HOST: vision-service-model
+
+      VISION_PORT: 8083
+
+
+    ports:
+
+      - "127.0.0.1:8001:8001"
+
+
+    volumes:
+
+      - D:/AI-ACE/documents:/documents
+
+      - D:/AI-ACE/models/vision:/models/vision:ro
+
+      - D:/AI-ACE/knowledge:/knowledge
+
+
+    networks:
+
+      - ai-private-net
+
+
+    restart: unless-stopped
+
+
+
+
+
+  open-webui:
+
+
+    image: ghcr.io/open-webui/open-webui:main
+
+
+    container_name: open-webui
+
+
+
+    depends_on:
+
+
+      - ace-qdrant
+
+
+
+    environment:
+
+
+      ENABLE_RAG: "true"
+
+
+      ENABLE_WEB_SEARCH: "false"
+
+
+      ANONYMIZED_TELEMETRY: "false"
+
+
+      DO_NOT_TRACK: "true"
+
+
+      VECTOR_DB: qdrant
+
+
+      QDRANT_URI: http://ace-qdrant:6333
+
+
+
+    ports:
+
+
+      - "127.0.0.1:3000:8080"
+
+
+
+    volumes:
+
+
+      - D:/AI-ACE/open-webui:/app/backend/data
+
+
+
+    networks:
+
+
+      - ai-private-net
+
+
+
+    restart: unless-stopped
+
+
+
+
+
+  ace-docx-generator:
+
+
+    build:
+
+      context: D:/AI-ACE/services/docx-generator
+
+      dockerfile: Dockerfile
+
+
+    container_name: ace-docx-generator
+
+
+    ports:
+
+
+      - "127.0.0.1:8003:8003"
+
+
+
+    volumes:
+
+
+      - D:/AI-ACE/documents/output:/output
+
+
+
+    networks:
+
+
+      - ai-private-net
+
+
+
+    restart: unless-stopped
+
+
+
+
+
+networks:
+
+
+  ai-private-net:
+
+
+    name: ai-private-net
+
+    external: true

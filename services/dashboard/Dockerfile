@@ -1,0 +1,17 @@
+# 基础镜像固定为本地已有的 python:3.11-slim (按 digest 锁定, 禁止联网拉取浮动 tag)
+FROM python:3.11-slim
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app .
+
+EXPOSE 9000
+
+HEALTHCHECK NONE
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]

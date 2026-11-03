@@ -1,0 +1,16 @@
+# 基础镜像固定为本地已有的 python:3.11-slim (按 digest 锁定, 禁止联网拉取浮动 tag)
+FROM python:3.11-slim@sha256:90744cff8f32887f075c47d747a173ff333e9e98801667af93c357fa9f5e28ff
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app .
+
+EXPOSE 9000
+
+HEALTHCHECK NONE
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]

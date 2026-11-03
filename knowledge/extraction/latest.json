@@ -1,0 +1,26 @@
+[
+  {
+    "name": "AI-ACE",
+    "type": "系统名称",
+    "description": "企业内部人工智能平台",
+    "context": "AI-ACE 是企业内部人工智能平台。"
+  },
+  {
+    "name": "Qwen3-4B",
+    "type": "AI模型名称",
+    "description": "本地大模型",
+    "context": "系统使用 Qwen3-4B 本地大模型。"
+  },
+  {
+    "name": "Qdrant",
+    "type": "数据库名称",
+    "description": "知识库使用 Qdrant",
+    "context": "知识库使用 Qdrant。"
+  },
+  {
+    "name": "RTX 4060",
+    "type": "硬件型号",
+    "description": "GPU 使用 RTX 4060 CUDA 加速",
+    "context": "GPU 使用 RTX 4060 CUDA 加速。"
+  }
+]

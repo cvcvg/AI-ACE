@@ -1,0 +1,785 @@
+"""AI-ACE 本地文件工具服务 (file-tools)
+
+把 documents 目录交给 AI 读写: 列目录 / 读文本全文 / 读 PDF·Word·Excel·PPT 正文
+/ 看图片 / 全文检索 / 知识库检索 / 自动重建索引。
+
+全离线: 只连栈内服务 (document-parser, rag-service, vision-service), 不访问公网。
+运行在 open-webui 镜像内 (已自带 pypdf / docx2txt / python-pptx / openpyxl / pillow),
+源码只读挂载, 不需要单独构建镜像。
+"""
+
+from __future__ import annotations
+
+import base64
+import html
+import json
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import urllib.error
+import urllib.request
+
+from fastapi import FastAPI, HTTPException, Query
+
+LOG = logging.getLogger("file-tools")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
+WATCH_DIR = Path(os.getenv("WATCH_DIR", str(DATA_DIR / "input"))).resolve()
+PARSER_URL = os.getenv("PARSER_URL", "http://ace-document-parser:8000").rstrip("/")
+RAG_URL = os.getenv("RAG_URL", "http://ace-rag-service:8002").rstrip("/")
+VISION_URL = os.getenv("VISION_URL", "http://vision-service-model:8083").rstrip("/")
+VISION_MODEL = os.getenv("VISION_MODEL", "Qwen2.5-VL-3B")
+
+WATCH_ENABLED = os.getenv("WATCH_ENABLED", "true").lower() == "true"
+WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL", "15"))
+STABLE_SECONDS = int(os.getenv("STABLE_SECONDS", "6"))
+REINDEX_MIN_GAP = int(os.getenv("REINDEX_MIN_GAP", "90"))
+INDEX_ON_START = os.getenv("INDEX_ON_START", "false").lower() == "true"
+
+# 单文件处理上限: 50MB (读取阶段还会按需截断, 不会把整本书塞进模型)
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(50 * 1024 * 1024)))
+# 单次提取的文本总长上限, 防止超大 Excel/PDF 撑爆内存
+MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", str(3_000_000)))
+
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".log", ".py", ".js", ".ts", ".java", ".go",
+    ".c", ".h", ".cpp", ".cs", ".rs", ".sh", ".bat", ".ps1", ".sql", ".xml", ".html",
+    ".htm", ".css", ".tex", ".rst", ".env", ".properties", ".srt", ".vtt",
+}
+DOC_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".html", ".htm"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+EXTRACT_CACHE: dict[str, tuple[float, int, str, str]] = {}
+STATE: dict[str, Any] = {
+    "last_reindex": None,
+    "last_reindex_ok": None,
+    "last_reindex_files": 0,
+    "last_reindex_msg": "",
+    "pending": False,
+    "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+}
+LOCK = threading.Lock()
+
+app = FastAPI(
+    title="AI-ACE 本地文件工具",
+    description="让 AI 读取 documents 目录: 列目录、读文本/PDF/Word/Excel/PPT、看图、检索知识库。",
+    version="2.0.0",
+)
+
+
+# ---------------------------------------------------------------- 基础工具
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _rel(path: Path) -> str:
+    return path.relative_to(DATA_DIR).as_posix()
+
+
+def _resolve(rel: str) -> Path:
+    """把用户给的相对路径解析到 DATA_DIR 内, 越界直接拒绝。"""
+    raw = (rel or "").strip().replace("\\", "/").lstrip("/")
+    if not raw:
+        raise HTTPException(status_code=400, detail="path 不能为空")
+    target = (DATA_DIR / PurePosixPath(raw)).resolve()
+    try:
+        target.relative_to(DATA_DIR)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="路径越界, 只允许 documents 目录内的文件")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {raw}")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail=f"这是目录, 不是文件: {raw}")
+    return target
+
+
+def _size_ok(path: Path) -> None:
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        mb = MAX_FILE_BYTES / 1024 / 1024
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件 {size / 1024 / 1024:.1f}MB 超过单文件上限 {mb:.0f}MB, 请先在本地拆分",
+        )
+
+
+def _decode(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "big5", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _read_text(path: Path, limit: int | None = None) -> str:
+    _size_ok(path)
+    raw = path.read_bytes()[: limit or MAX_FILE_BYTES]
+    return _decode(raw)
+
+
+def _numbered(text: str, start_line: int, max_lines: int, max_chars: int) -> dict:
+    lines = text.splitlines()
+    total = len(lines)
+    begin = max(start_line - 1, 0)
+    chunk = lines[begin: begin + max_lines]
+    out: list[str] = []
+    used = 0
+    last = begin
+    for idx, line in enumerate(chunk, start=begin + 1):
+        piece = f"{idx:6d}| {line}"
+        if used + len(piece) + 1 > max_chars and out:
+            break
+        out.append(piece)
+        used += len(piece) + 1
+        last = idx
+    return {
+        "text": "\n".join(out),
+        "start_line": begin + 1,
+        "end_line": last,
+        "total_lines": total,
+        "truncated": last < total,
+    }
+
+
+# ---------------------------------------------------------------- 文档解析
+
+
+def _extract_pdf(path: Path) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    parts: list[str] = []
+    used = 0
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            body = (page.extract_text() or "").strip()
+        except Exception:  # 个别损坏页跳过, 不影响其它页
+            body = ""
+        block = f"\n\n[第 {i} 页]\n{body}"
+        parts.append(block)
+        used += len(block)
+        if used > MAX_EXTRACT_CHARS:
+            parts.append("\n\n[已达提取上限, 后面的页没有读取]")
+            break
+    return "".join(parts).strip()
+
+
+def _extract_docx(path: Path) -> str:
+    import docx2txt
+
+    text = docx2txt.process(str(path)) or ""
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _extract_pptx(path: Path) -> str:
+    from pptx import Presentation
+
+    prs = Presentation(str(path))
+    parts: list[str] = []
+    for i, slide in enumerate(prs.slides, 1):
+        buf: list[str] = []
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            txt = (shape.text_frame.text or "").strip()
+            if txt:
+                buf.append(txt)
+        body = "\n".join(buf).strip()
+        parts.append(f"\n\n[第 {i} 页幻灯片]\n{body}")
+    return "".join(parts).strip()
+
+
+def _extract_xlsx(path: Path) -> str:
+    import openpyxl
+
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    parts: list[str] = []
+    used = 0
+    for ws in wb.worksheets:
+        parts.append(f"\n\n[工作表 {ws.title}]")
+        used += len(parts[-1])
+        for row in ws.iter_rows(values_only=True):
+            cells = [("" if c is None else str(c)).strip() for c in row]
+            if not any(cells):
+                continue
+            line = "|".join(cells).rstrip("|")
+            parts.append(line)
+            used += len(line) + 1
+            if used > MAX_EXTRACT_CHARS:
+                parts.append("[已达提取上限, 后面的行没有读取]")
+                wb.close()
+                return "\n".join(parts).strip()
+    wb.close()
+    return "\n".join(parts).strip()
+
+
+def _extract_html(path: Path) -> str:
+    raw = _read_text(path)
+    raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?s)<br\s*/?>|</p>|</div>|</tr>|</h[1-6]>", "\n", raw)
+    raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+    return re.sub(r"[ \t]{2,}", " ", html.unescape(raw)).strip()
+
+
+def _suffix(path: Path) -> str:
+    return path.suffix.lower()
+
+
+def _kind(path: Path) -> str:
+    s = _suffix(path)
+    if s in IMAGE_SUFFIXES:
+        return "image"
+    if s == ".pdf":
+        return "pdf"
+    if s == ".docx":
+        return "docx"
+    if s == ".pptx":
+        return "pptx"
+    if s in {".xlsx", ".xlsm"}:
+        return "xlsx"
+    if s in {".html", ".htm"}:
+        return "html"
+    if s in TEXT_SUFFIXES:
+        return "text"
+    return "unknown"
+
+
+def _extract(path: Path) -> tuple[str, str]:
+    """返回 (kind, 正文文本)。结果按 (mtime, size) 缓存, 避免反复解析大文件。"""
+    key = str(path)
+    st = path.stat()
+    cached = EXTRACT_CACHE.get(key)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2], cached[3]
+
+    _size_ok(path)
+    kind = _kind(path)
+    if kind == "pdf":
+        text = _extract_pdf(path)
+    elif kind == "docx":
+        text = _extract_docx(path)
+    elif kind == "pptx":
+        text = _extract_pptx(path)
+    elif kind == "xlsx":
+        text = _extract_xlsx(path)
+    elif kind == "html":
+        text = _extract_html(path)
+    elif kind == "text":
+        text = _read_text(path)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"看不懂这种文件: {path.name}. 支持 PDF / Word(.docx) / Excel / PPT / 图片 / 文本类",
+        )
+    if len(EXTRACT_CACHE) > 200:
+        EXTRACT_CACHE.clear()
+    EXTRACT_CACHE[key] = (st.st_mtime, st.st_size, kind, text)
+    return kind, text
+
+
+def _page_hint(kind: str, text: str) -> str:
+    if kind == "pdf":
+        n = len(re.findall(r"\[第 \d+ 页\]", text))
+        return f"PDF, 共 {n} 页"
+    if kind == "pptx":
+        n = len(re.findall(r"\[第 \d+ 页幻灯片\]", text))
+        return f"PPT, 共 {n} 页幻灯片"
+    if kind == "xlsx":
+        n = len(re.findall(r"\[工作表 ", text))
+        return f"Excel, 共 {n} 个工作表"
+    return kind
+
+
+# ---------------------------------------------------------------- 内部 HTTP
+
+
+def _post_json(url: str, payload: dict | None, timeout: int = 60) -> dict:
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _get_json(url: str, timeout: int = 10) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+# ---------------------------------------------------------------- 工具接口
+
+
+@app.get("/health", summary="健康检查", include_in_schema=False)
+def health() -> dict:
+    parser = "unknown"
+    try:
+        _get_json(f"{PARSER_URL}/health")
+        parser = "ok"
+    except Exception:
+        parser = "unreachable"
+    vision = "unknown"
+    try:
+        _get_json(f"{VISION_URL}/health")
+        vision = "ok"
+    except Exception:
+        vision = "unreachable"
+    return {
+        "status": "ok",
+        "data_dir": str(DATA_DIR),
+        "watch_dir": str(WATCH_DIR),
+        "watch_enabled": WATCH_ENABLED,
+        "parser": parser,
+        "vision": vision,
+        "max_file_mb": MAX_FILE_BYTES // (1024 * 1024),
+        "last_reindex": STATE["last_reindex"],
+    }
+
+
+@app.get(
+    "/files/list",
+    operation_id="list_files",
+    summary="列出 documents 目录里的文件",
+)
+def list_files(
+    subdir: str = Query("", description="子目录, 例如 input / 报告。留空表示 documents 根目录"),
+    recursive: bool = Query(True, description="是否包含子目录"),
+    limit: int = Query(300, ge=1, le=2000),
+) -> dict:
+    base = DATA_DIR
+    if subdir.strip():
+        base = _resolve_dir(subdir)
+    items: list[dict] = []
+    iterator = base.rglob("*") if recursive else base.glob("*")
+    for path in sorted(iterator):
+        if len(items) >= limit:
+            break
+        if not path.is_file():
+            continue
+        try:
+            rel = _rel(path)
+        except ValueError:
+            continue
+        st = path.stat()
+        items.append({
+            "path": rel,
+            "name": path.name,
+            "size": st.st_size,
+            "size_human": _human(st.st_size),
+            "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "kind": _kind(path),
+            "text": _suffix(path) in TEXT_SUFFIXES,
+        })
+    return {"count": len(items), "limit": limit, "files": items}
+
+
+def _resolve_dir(rel: str) -> Path:
+    raw = (rel or "").strip().replace("\\", "/").lstrip("/")
+    target = (DATA_DIR / PurePosixPath(raw)).resolve()
+    try:
+        target.relative_to(DATA_DIR)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="路径越界, 只允许 documents 目录内的路径")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"目录不存在: {rel}")
+    return target
+
+
+def _human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
+@app.get(
+    "/files/read",
+    operation_id="read_file",
+    summary="读取纯文本文件(带行号), 可指定起始行",
+)
+def read_file(
+    path: str = Query(..., description="文件路径, 相对 documents 目录, 例如 input/笔记.txt"),
+    start_line: int = Query(1, ge=1, description="从第几行开始, 默认 1"),
+    max_lines: int = Query(200, ge=1, le=2000),
+    max_chars: int = Query(4000, ge=200, le=20000),
+) -> dict:
+    target = _resolve(path)
+    if _suffix(target) not in TEXT_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail="这不是纯文本文件, 请用 read_document 读 PDF / Word / Excel / PPT 正文",
+        )
+    text = _read_text(target)
+    data = _numbered(text, start_line, max_lines, max_chars)
+    data.update({"path": _rel(target), "kind": "text", "size": target.stat().st_size})
+    return data
+
+
+@app.get(
+    "/documents/read",
+    operation_id="read_document",
+    summary="读取 PDF / Word / Excel / PPT / 文本 的正文(按字符分页), 一次读不完就继续读",
+)
+def read_document(
+    path: str = Query(..., description="文件路径, 相对 documents 目录"),
+    offset: int = Query(0, ge=0, description="从第几个字符开始, 上次返回的 next_offset 直接填这里"),
+    max_chars: int = Query(4000, ge=500, le=20000, description="本次最多返回多少字"),
+) -> dict:
+    target = _resolve(path)
+    kind, text = _extract(target)
+    total = len(text)
+    if total == 0:
+        return {
+            "path": _rel(target), "kind": kind, "total_chars": 0,
+            "offset": 0, "next_offset": None, "truncated": False,
+            "text": "(没有提取到文字。如果是扫描件或图片型 PDF, 请用 describe_image 看图)",
+        }
+    begin = min(offset, total)
+    end = min(begin + max_chars, total)
+    return {
+        "path": _rel(target),
+        "kind": kind,
+        "hint": _page_hint(kind, text),
+        "total_chars": total,
+        "offset": begin,
+        "next_offset": end if end < total else None,
+        "truncated": end < total,
+        "text": text[begin:end],
+    }
+
+
+@app.get(
+    "/documents/outline",
+    operation_id="outline_document",
+    summary="先看文档目录/结构(PDF 每页首行、Excel 工作表、PPT 每页标题、文本前几行)",
+)
+def outline_document(
+    path: str = Query(..., description="文件路径, 相对 documents 目录"),
+    limit: int = Query(60, ge=5, le=300, description="最多列出多少条结构信息"),
+) -> dict:
+    target = _resolve(path)
+    kind, text = _extract(target)
+    items: list[dict] = []
+    if kind == "pdf":
+        for m in re.finditer(r"\[第 (\d+) 页\]\s*\n?(.{0,80})", text):
+            page = int(m.group(1))
+            head = m.group(2).strip().splitlines()[0] if m.group(2).strip() else "(本页无文字)"
+            items.append({"locator": f"第 {page} 页", "head": head})
+            if len(items) >= limit:
+                break
+    elif kind == "pptx":
+        for m in re.finditer(r"\[第 (\d+) 页幻灯片\]\s*\n?(.{0,80})", text):
+            page = int(m.group(1))
+            head = m.group(2).strip().splitlines()[0] if m.group(2).strip() else "(本页无文字)"
+            items.append({"locator": f"第 {page} 页幻灯片", "head": head})
+            if len(items) >= limit:
+                break
+    elif kind == "xlsx":
+        for m in re.finditer(r"\[工作表 ([^\]]+)\]", text):
+            items.append({"locator": f"工作表 {m.group(1)}", "head": ""})
+            if len(items) >= limit:
+                break
+    else:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for i, line in enumerate(lines[:limit], 1):
+            items.append({"locator": f"第 {i} 行", "head": line[:80]})
+    return {
+        "path": _rel(target),
+        "kind": kind,
+        "hint": _page_hint(kind, text),
+        "total_chars": len(text),
+        "items": items,
+        "truncated_items": len(items) >= limit,
+    }
+
+
+@app.get(
+    "/documents/search",
+    operation_id="search_in_file",
+    summary="在单个文件(含 PDF/Word/Excel/PPT)里搜关键词, 返回命中上下文与字符位置",
+)
+def search_in_file(
+    path: str = Query(..., description="文件路径, 相对 documents 目录"),
+    query: str = Query(..., min_length=1, description="要搜的词"),
+    ignore_case: bool = Query(True),
+    limit: int = Query(10, ge=1, le=50),
+    context_chars: int = Query(120, ge=20, le=400),
+) -> dict:
+    target = _resolve(path)
+    kind, text = _extract(target)
+    needle = query if not ignore_case else query.lower()
+    hay = text if not ignore_case else text.lower()
+    hits: list[dict] = []
+    start = 0
+    while len(hits) < limit:
+        idx = hay.find(needle, start)
+        if idx < 0:
+            break
+        lo = max(idx - context_chars, 0)
+        hi = min(idx + len(query) + context_chars, len(text))
+        hits.append({
+            "offset": idx,
+            "snippet": text[lo:hi].replace("\n", " ⏎ ").strip(),
+        })
+        start = idx + max(len(query), 1)
+    return {
+        "path": _rel(target),
+        "kind": kind,
+        "query": query,
+        "count": len(hits),
+        "hits": hits,
+        "hint": "拿到 offset 后用 read_document(path, offset=...) 读命中处的完整上下文",
+    }
+
+
+@app.get(
+    "/files/search",
+    operation_id="search_files",
+    summary="在 documents 目录里按文件名和纯文本正文搜索",
+)
+def search_files(
+    query: str = Query(..., min_length=1, description="要找的关键词"),
+    subdir: str = Query("", description="限定子目录, 留空=全部"),
+    ignore_case: bool = Query(True),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict:
+    base = _resolve_dir(subdir) if subdir.strip() else DATA_DIR
+    needle = query.lower() if ignore_case else query
+    hits: list[dict] = []
+    for path in sorted(base.rglob("*")):
+        if len(hits) >= limit:
+            break
+        if not path.is_file():
+            continue
+        name_cmp = path.name.lower() if ignore_case else path.name
+        if needle in name_cmp:
+            hits.append({"path": _rel(path), "where": "文件名", "line": 0, "snippet": path.name})
+            continue
+        if _suffix(path) not in TEXT_SUFFIXES:
+            continue
+        try:
+            text = _read_text(path)
+        except Exception:
+            continue
+        body = text.lower() if ignore_case else text
+        idx = body.find(needle)
+        if idx < 0:
+            continue
+        line_no = body.count("\n", 0, idx) + 1
+        lo = max(idx - 80, 0)
+        hi = min(idx + len(query) + 80, len(text))
+        hits.append({
+            "path": _rel(path),
+            "where": "内容",
+            "line": line_no,
+            "snippet": text[lo:hi].replace("\n", " ⏎ ").strip(),
+        })
+    return {"query": query, "count": len(hits), "hits": hits}
+
+
+@app.get(
+    "/images/describe",
+    operation_id="describe_image",
+    summary="让本地视觉模型看图片(照片/截图/扫描件), 返回描述与读出的文字",
+)
+def describe_image(
+    path: str = Query(..., description="图片路径, 相对 documents 目录"),
+    question: str = Query("请用中文描述这张图片的内容; 如果图中有文字, 请逐字读出来。"),
+    max_tokens: int = Query(512, ge=64, le=2048),
+) -> dict:
+    target = _resolve(path)
+    if _suffix(target) not in IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="这不是图片文件")
+    _size_ok(target)
+    mime = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".bmp": "image/bmp", ".gif": "image/gif",
+        ".tif": "image/tiff", ".tiff": "image/tiff",
+    }[_suffix(target)]
+    b64 = base64.b64encode(target.read_bytes()).decode("ascii")
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ],
+        }],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    try:
+        resp = _post_json(f"{VISION_URL}/v1/chat/completions", payload, timeout=180)
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"视觉服务返回错误 {exc.code}: {exc.reason}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"连不上视觉服务 {VISION_URL} ({exc}). 请用 --profile vision 启动 ace-vision-service-model",
+        )
+    try:
+        answer = resp["choices"][0]["message"]["content"].strip()
+    except Exception:
+        answer = json.dumps(resp)[:2000]
+    return {"path": _rel(target), "model": VISION_MODEL, "answer": answer}
+
+
+@app.get(
+    "/knowledge/search",
+    operation_id="search_knowledge",
+    summary="在已入库的知识库里做语义检索(适合问'哪份文件提到了X')",
+)
+def search_knowledge(
+    query: str = Query(..., min_length=1),
+    limit: int = Query(4, ge=1, le=10),
+) -> dict:
+    try:
+        resp = _post_json(f"{RAG_URL}/search", {"text": query, "limit": limit}, timeout=60)
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"知识库服务返回错误 {exc.code}")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"连不上知识库服务 {RAG_URL} ({exc})")
+    results = resp.get("results") or resp.get("documents") or []
+    cleaned = []
+    for item in results[:limit]:
+        if isinstance(item, dict):
+            cleaned.append({
+                "score": round(float(item.get("score", 0) or 0), 4),
+                "source": item.get("source") or item.get("path") or item.get("file") or "",
+                "chunk": str(item.get("chunk") or item.get("text") or item.get("content") or "")[:600],
+            })
+        else:
+            cleaned.append({"score": 0, "source": "", "chunk": str(item)[:600]})
+    return {"query": query, "count": len(cleaned), "results": cleaned}
+
+
+@app.get(
+    "/knowledge/status",
+    operation_id="knowledge_status",
+    summary="看知识库是否已更新(有多少文件待入库、上次重建时间)",
+)
+def knowledge_status() -> dict:
+    parser = "unknown"
+    detail: Any = None
+    try:
+        detail = _get_json(f"{PARSER_URL}/health")
+        parser = "ok"
+    except Exception as exc:
+        parser = f"unreachable ({exc})"
+    return {
+        "parser": parser,
+        "parser_detail": detail,
+        "last_reindex": STATE["last_reindex"],
+        "last_reindex_ok": STATE["last_reindex_ok"],
+        "last_reindex_files": STATE["last_reindex_files"],
+        "last_reindex_msg": STATE["last_reindex_msg"],
+        "pending": STATE["pending"],
+        "watch_dir": str(WATCH_DIR),
+    }
+
+
+@app.post(
+    "/knowledge/reindex",
+    operation_id="reindex_knowledge",
+    summary="手动重建知识库索引(一般不需要, 放文件进目录会自动重建)",
+)
+def reindex_knowledge() -> dict:
+    ok, msg = _do_reindex()
+    if not ok:
+        raise HTTPException(status_code=502, detail=msg)
+    return {"ok": True, "message": msg}
+
+
+# ---------------------------------------------------------------- 目录监听
+
+
+def _snapshot(root: Path) -> dict[str, tuple[float, int]]:
+    snap: dict[str, tuple[float, int]] = {}
+    if not root.exists():
+        return snap
+    for path in root.rglob("*"):
+        if path.is_file():
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            snap[str(path)] = (st.st_mtime, st.st_size)
+    return snap
+
+
+def _do_reindex() -> tuple[bool, str]:
+    with LOCK:
+        STATE["pending"] = True
+        try:
+            resp = _post_json(f"{PARSER_URL}/reindex", {}, timeout=1800)
+            files = 0
+            for key in ("indexed", "files", "count", "total", "documents"):
+                value = resp.get(key)
+                if isinstance(value, int):
+                    files = max(files, value)
+            STATE.update({
+                "last_reindex": _now(),
+                "last_reindex_ok": True,
+                "last_reindex_files": files,
+                "last_reindex_msg": json.dumps(resp, ensure_ascii=False)[:400],
+                "pending": False,
+            })
+            LOG.info("reindex ok, files=%s", files)
+            return True, f"已重建索引, 文件 {files} 个"
+        except Exception as exc:
+            STATE.update({
+                "last_reindex": _now(),
+                "last_reindex_ok": False,
+                "last_reindex_msg": str(exc)[:400],
+                "pending": False,
+            })
+            LOG.warning("reindex failed: %s", exc)
+            return False, f"重建索引失败: {exc}"
+
+
+def _watch_loop() -> None:
+    last_change = 0.0
+    base = _snapshot(WATCH_DIR)
+    LOG.info("watch start: %s interval=%ss", WATCH_DIR, WATCH_INTERVAL)
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            cur = _snapshot(WATCH_DIR)
+            if cur != base:
+                time.sleep(STABLE_SECONDS)
+                again = _snapshot(WATCH_DIR)
+                if again != cur:
+                    base = again
+                    continue
+                added = len(set(again) - set(base))
+                changed = len(set(again) ^ set(base))
+                LOG.info("detected change: new=%s diff=%s", added, changed)
+                base = again
+                if time.time() - last_change < REINDEX_MIN_GAP:
+                    continue
+                last_change = time.time()
+                _do_reindex()
+            else:
+                base = cur
+        except Exception as exc:  # 监听线程不能死
+            LOG.warning("watch loop error: %s", exc)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    LOG.info("file-tools up: data=%s watch=%s enabled=%s", DATA_DIR, WATCH_DIR, WATCH_ENABLED)
+    if WATCH_ENABLED:
+        threading.Thread(target=_watch_loop, name="watch", daemon=True).start()
+    if INDEX_ON_START:
+        threading.Thread(target=_do_reindex, name="reindex-on-start", daemon=True).start()

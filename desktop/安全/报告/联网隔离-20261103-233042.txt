@@ -1,0 +1,25 @@
+﻿AI-ACE 联网隔离  2026-11-03 23:30:37  G:\AI-ACE\desktop\安全\联网隔离.ps1
+提示: Docker 引擎没在跑（或者 docker.exe 不在 PATH 里）
+环境: wsl=True  engine=False  iptables=False
+
+== 1/4 容器网络与端口绑定 (docker ps) ==
+[无法确认] Docker 引擎没在跑，容器网络无法核对（先启动 Docker Desktop 再跑一次）
+
+== 2/4 宿主机监听地址 (Get-NetTCPConnection -State Listen) ==
+  3000  无监听（服务没起时正常）
+  9000  无监听（服务没起时正常）
+  8010  无监听（服务没起时正常）
+  8011  无监听（服务没起时正常）
+  8081  无监听（服务没起时正常）
+  五个端口都没人监听（Docker 没启动时就是这样）
+
+== 3/4 拦截规则原文 (docker-desktop WSL 里的 iptables) ==
+[无法确认] 这个发行版里没有 iptables（引擎没启动时就是这样，退出码 127），规则无法核对
+
+== 4/4 端到端外连试探 (ace-gateway 里连 1.1.1.1:80) ==
+[无法确认] Docker 引擎没在跑，外连试探做不了
+
+== 附 Docker Desktop 遥测/更新开关 (settings-store.json) ==
+  你的 Docker 版本没有这些键，请在 Settings → General 里手动关掉使用统计和自动更新检查。
+报告: G:\AI-ACE\desktop\安全\报告\联网隔离-20261103-233042.txt
+RESULT: WARN 有 0 个风险项、3 项无法确认，详见报告

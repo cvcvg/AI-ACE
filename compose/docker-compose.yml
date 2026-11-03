@@ -1,0 +1,538 @@
+# =====================================================================
+# AI-ACE 权威 docker-compose.yml
+# 完全本地化企业 AI 平台
+#
+# 设计原则:
+#   - 核心服务常驻 (Qdrant / 解析 / RAG / 术语 / 文档生成 / 视觉 / WebUI / Dashboard)
+#   - 模型服务按需启动 (Qwen3 / Vision 走 profiles, 默认不启动)
+#   - 所有端口仅绑定 127.0.0.1 (localhost), 禁止外网访问
+#   - 所有 volume 使用相对路径; 5 类数据目录可用 compose\.env 的 AIACE_DATA 改到别的盘
+#   - 关闭遥测, HuggingFace 完全离线
+#
+# 离线部署注意:
+#   image 使用 tag 引用 (而非 @sha256 digest), 必须与 export-images.bat 的导出
+#   清单完全一致 —— 目标机器 docker load 之后才可能命中镜像。若改用 digest,
+#   必须保证该 digest 的镜像在本机已存在, 否则 pull_policy: never 会直接报
+#   "No such image" 且无法联网补救。
+# =====================================================================
+
+services:
+
+  # ================================
+  # Qdrant 本地向量数据库 (常驻)
+  # ================================
+  ace-qdrant:
+    image: qdrant/qdrant:latest
+    pull_policy: never
+    container_name: ace-qdrant
+    environment:
+      # Qdrant 默认向 telemetry.qdrant.io 上报, 离线机必须显式关掉
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - ${AIACE_DATA:-..}/knowledge/vector_db:/qdrant/storage
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+
+  # ================================
+  # Qwen3-4B 文本模型 (按需启动)
+  # ================================
+  qwen3-text-service:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    pull_policy: never
+    container_name: qwen3-text-service
+    profiles: ["qwen3"]
+    command:
+      - "-m"
+      - "/models/Qwen3-4B-Q4_K_M.gguf"
+      - "--alias"
+      - "Qwen3-4B"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+      - "--n-gpu-layers"
+      - "999"
+      # --jinja: 使用 GGUF 内置的对话模板, 原生 function calling(工具调用) 依赖它
+      - "--jinja"
+      # FlashAttention + 8bit KV cache: KV 显存约减半, 24K 上下文比原来 16K 还省约 0.8GB
+      # 若镜像版本太老不认这两个参数, 删掉下面 5 行即可回退
+      - "-fa"
+      - "on"
+      - "-ctk"
+      - "q8_0"
+      - "-ctv"
+      - "q8_0"
+      # 并行槽: 2 个请求可以同时生成(否则会在 llama.cpp 里排队等槽)
+      # -c 是所有槽共享的总上下文, 每槽 = c / np; 32768 / 2 = 每任务 16384
+      # 回退单槽: 设 QWEN3_PARALLEL=1 且 QWEN3_CTX=24576
+      - "-np"
+      - "${QWEN3_PARALLEL:-2}"
+      - "-c"
+      - "${QWEN3_CTX:-32768}"
+    volumes:
+      - ../models/qwen3-4b:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ai-private-net
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # ================================
+  # Qwen2.5-VL-3B 视觉模型 (按需启动)
+  # ================================
+  vision-service-model:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    pull_policy: never
+    container_name: vision-service-model
+    profiles: ["vision"]
+    command:
+      - "-m"
+      - "/models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+      - "--mmproj"
+      - "/models/mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"
+      - "--alias"
+      - "Qwen2.5-VL-3B"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8083"
+      - "--n-gpu-layers"
+      - "999"
+      - "-c"
+      - "4096"
+    volumes:
+      - ../models/vision:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ai-private-net
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # ================================
+  # 文档解析服务 (常驻)
+  # ================================
+  ace-document-parser:
+    build:
+      context: ../services/document-parser
+      dockerfile: Dockerfile
+    container_name: ace-document-parser
+    depends_on:
+      ace-qdrant:
+        condition: service_started
+    environment:
+      QDRANT_HOST: ace-qdrant
+      QDRANT_PORT: "6333"
+      TERM_EXTRACTOR_URL: http://ace-term-extractor:8004/extract
+      VISION_SERVICE_URL: http://ace-vision-service:8001/analyze
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ${AIACE_DATA:-..}/documents:/documents
+      - ../models/embedding:/models/embedding:ro
+      - ${AIACE_DATA:-..}/knowledge:/knowledge
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================
+  # 术语抽取服务 (常驻)
+  # ================================
+  ace-term-extractor:
+    build:
+      context: ../services/term-extractor
+      dockerfile: Dockerfile
+    container_name: ace-term-extractor
+    depends_on:
+      ace-qdrant:
+        condition: service_started
+    environment:
+      QDRANT_HOST: ace-qdrant
+      QDRANT_PORT: "6333"
+      LLM_HOST: http://qwen3-text-service:8081
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ../models/embedding:/models/embedding:ro
+      - ${AIACE_DATA:-..}/knowledge:/knowledge
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8004/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================
+  # RAG 检索服务 (常驻)
+  # ================================
+  ace-rag-service:
+    build:
+      context: ../services/rag-service
+      dockerfile: Dockerfile
+    container_name: ace-rag-service
+    depends_on:
+      ace-qdrant:
+        condition: service_started
+    environment:
+      QDRANT_HOST: ace-qdrant
+      QDRANT_PORT: "6333"
+      LLM_HOST: http://qwen3-text-service:8081
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ../models/embedding:/models/embedding:ro
+      - ${AIACE_DATA:-..}/knowledge:/knowledge
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8002/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================
+  # 本地文件工具 (常驻, 给模型读文件 + 自动入库)
+  # ================================
+  ace-file-tools:
+    # 复用已导入的 open-webui 镜像: 该镜像自带 Python / FastAPI / uvicorn,
+    # 直接在其中运行我们的脚本 -> 离线部署不需要额外构建或额外导出镜像
+    image: ghcr.io/open-webui/open-webui:main
+    pull_policy: never
+    container_name: ace-file-tools
+    entrypoint: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010"]
+    working_dir: /srv/file-tools
+    depends_on:
+      ace-document-parser:
+        condition: service_started
+      ace-rag-service:
+        condition: service_started
+      ace-docx-generator:
+        condition: service_started
+    environment:
+      DATA_DIR: /data
+      WATCH_DIR: /data/input
+      PARSER_URL: http://ace-document-parser:8000
+      RAG_URL: http://ace-rag-service:8002
+      WATCH_ENABLED: "true"
+      WATCH_INTERVAL: "15"
+      REINDEX_MIN_GAP: "90"
+      INDEX_ON_START: "false"
+      # 单文件上限 50MB (PDF/Excel 常见), 超出直接提示, 不会静默失败
+      MAX_FILE_BYTES: "52428800"
+      # 看图/扫描件走本地视觉模型; 该容器属于 vision profile, 没启动时接口会返回 503 并提示
+      VISION_URL: http://vision-service-model:8083
+      VISION_MODEL: Qwen2.5-VL-3B
+      # 写文件 / 执行代码 / 生成文档的范围 = 整个 AI-ACE 工作目录 (挂载到 /work)
+      OUTPUT_DIR: /work
+      # 受保护目录: 这些前缀下只读, 防止 AI 改坏数据库/上传件/模型
+      PROTECTED_PREFIXES: open-webui/webui.db,open-webui/uploads,open-webui/vector_db,open-webui/cache,models,backup,database,.git
+      # 生成 Word / Excel 走栈内 docx-generator
+      DOCX_URL: http://ace-docx-generator:8003
+      # 自动执行器地址 (run_agent_task 转发到这里)
+      AGENT_URL: http://ace-agent:8011
+      # 单次执行代码的最长秒数上限 (run_python / run_shell 的 timeout_s 不能超过它的 5 倍)
+      RUN_TIMEOUT: "60"
+      MAX_RUN_OUTPUT: "6000"
+      # 断网闸门: AI 跑 python/shell 时把代理指向 127.0.0.1:9, curl/pip/requests 直接失败
+      BLOCK_INTERNET: "1"
+    volumes:
+      # 只读挂载: 模型只能读, 不能改/删用户放进去的原始文件
+      - ${AIACE_DATA:-..}/documents:/data:ro
+      # 可写: 整个 AI-ACE 工作目录 (宿主 G:\AI-ACE), AI 能读写代码/文档/脚本
+      - ../:/work:rw
+      # 数据目录可能已搬出安装目录(compose\.env 的 AIACE_DATA), 单挂回来;
+      # documents 必须可写: file-tools 的 OUTPUT_DIR=/work, write_file/run_python 都写 /work/documents
+      - ${AIACE_DATA:-..}/documents:/work/documents
+      - ${AIACE_DATA:-..}/output:/work/output
+      - ${AIACE_DATA:-..}/knowledge:/work/knowledge
+      - ${AIACE_DATA:-..}/database:/work/database
+      # 本服务源码只读挂载(升级时替换 app/main.py 即可, 无需重建镜像)
+      - ../services/file-tools/app:/srv/file-tools/app:ro
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8010/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ================================
+  # 全自动任务执行器 (常驻, 给一个目标自己跑完)
+  # ================================
+  ace-agent:
+    # 同样复用 open-webui 镜像: 不额外构建, 也不额外导出镜像
+    image: ghcr.io/open-webui/open-webui:main
+    pull_policy: never
+    container_name: ace-agent
+    entrypoint: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8011"]
+    working_dir: /srv/agent
+    depends_on:
+      ace-file-tools:
+        condition: service_started
+    environment:
+      WORK_DIR: /work
+      # 栈内 llama.cpp (Qwen3-4B, 已开 --jinja 原生工具调用)
+      LLM_URL: http://qwen3-text-service:8081
+      MODEL: Qwen3-4B
+      # 工具清单直接读 file-tools 的 OpenAPI
+      TOOLS_URL: http://ace-file-tools:8010
+      # 模型没起来时让控制中心拉起 (省显存, 不常驻)
+      DASHBOARD_URL: http://ace-dashboard:9000
+      DASHBOARD_CONTAINER: qwen3-text-service
+      # 自主上限: 24 步 / 30 分钟 (2026-11-03 由 12 步 / 15 分钟提高)
+      MAX_STEPS: "24"
+      MAX_SECONDS: "1800"
+      # 并行: 同时跑 2 个任务(一个在等模型时另一个可以跑工具); 单任务内多工具并发 4 路
+      # 只有一张显卡一个模型, 真正的提速来自"推理"和"工具执行"重叠, 不是两个模型同时算
+      MAX_PARALLEL: "2"
+      MAX_TOOL_WORKERS: "4"
+      # 经验记忆: 每个任务结束写一条 lessons.jsonl, 新任务按关键词+最近取 4 条注入提示词
+      MEMORY_TOP: "4"
+      # 无人值守: 往 documents/input/tasks 丢一个 .md 文件就会自动执行
+      WATCH_ENABLED: "true"
+      WATCH_INTERVAL: "20"
+    volumes:
+      - ../:/work:rw
+      # 数据目录可能已搬出安装目录(compose\.env 的 AIACE_DATA), 把 4 个子目录单挂回来,
+      # 否则 /work/documents、/work/output 等会落回安装目录里的空目录
+      - ${AIACE_DATA:-..}/documents:/work/documents
+      - ${AIACE_DATA:-..}/output:/work/output
+      - ${AIACE_DATA:-..}/knowledge:/work/knowledge
+      - ${AIACE_DATA:-..}/database:/work/database
+      # 本服务源码只读挂载(升级时替换 app/main.py 即可)
+      - ../services/agent/app:/srv/agent/app:ro
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8011/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ================================
+  # 文档生成服务 (常驻)
+  # ================================
+  ace-docx-generator:
+    build:
+      context: ../services/docx-generator
+      dockerfile: Dockerfile
+    container_name: ace-docx-generator
+    volumes:
+      - ${AIACE_DATA:-..}/documents/output:/output
+      - ${AIACE_DATA:-..}/knowledge:/knowledge:ro
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8003/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================
+  # 视觉分析服务 (常驻, 模型按需)
+  # ================================
+  ace-vision-service:
+    build:
+      context: ../vision-service
+      dockerfile: Dockerfile
+    container_name: ace-vision-service
+    environment:
+      VISION_HOST: vision-service-model
+      VISION_PORT: "8083"
+    volumes:
+      - ${AIACE_DATA:-..}/documents:/documents
+      - ../models/vision:/models/vision:ro
+      - ${AIACE_DATA:-..}/knowledge:/knowledge
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================
+  # Open WebUI 本地 AI 门户 (常驻)
+  # ================================
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    pull_policy: never
+    container_name: open-webui
+    depends_on:
+      ace-qdrant:
+        condition: service_started
+      ace-file-tools:
+        condition: service_started
+    environment:
+      # 单端点接入 AI-ACE 网关 (Dashboard): 网关负责按需启停模型容器并路由
+      # 用户在下拉菜单选择 Qwen3-4B / Qwen2.5-VL-3B 即自动切换
+      OPENAI_API_BASE_URLS: http://ace-dashboard:9000/v1
+      OPENAI_API_KEYS: sk-local-no-key-needed
+
+      # RAG 知识库
+      ENABLE_RAG: "true"
+      ENABLE_WEB_SEARCH: "false"
+      # 禁止 RAG 抓取远端 URL(内网易被误用为出网通道), 只处理上传的本地文件
+      ENABLE_LOCAL_WEB_FETCH: "false"
+      # 本栈不用 Ollama(模型统一走 Dashboard 的 OpenAI 兼容网关), 关掉避免无谓探测
+      ENABLE_OLLAMA_API: "false"
+      VECTOR_DB: qdrant
+      QDRANT_URI: http://ace-qdrant:6333
+      RAG_EMBEDDING_MODEL: /models/embedding
+      RAG_EMBEDDING_MODEL_DEVICE_TYPE: cpu
+
+      # 禁止遥测
+      ANONYMIZED_TELEMETRY: "false"
+      DO_NOT_TRACK: "true"
+      ENABLE_TELEMETRY: "False"
+      SCARF_NO_ANALYTICS: "true"
+
+      # 语音转写: 本地 faster-whisper (base), 模型已摊平到挂载目录, 不依赖 HF 缓存/联网
+      AUDIO_STT_ENGINE: ""
+      WHISPER_MODEL: /models/whisper/base
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_MODEL_AUTO_UPDATE: "false"
+
+      # —— 完全离线 / 零外联 ——
+      # OFFLINE_MODE 在启动时强制 HF_HUB_OFFLINE=1, 并关闭版本更新检查、插件联网安装
+      OFFLINE_MODE: "true"
+      # 让环境变量优先于数据库里的旧设置(PersistentConfig)。
+      # 老部署升级上来时, webui.db 里已存着旧默认值, 会盖掉下面这些环境变量; 关掉持久化才能保证加固生效。
+      # 代价: 管理后台改的设置不落库(重启回到环境变量值)。要在 UI 里长期调参, 删掉这一行再重启。
+      ENABLE_PERSISTENT_CONFIG: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      # 代码解释器默认从 CDN 拉 pyodide, 离线环境必然失败, 直接关闭
+      ENABLE_CODE_INTERPRETER: "false"
+      # 关闭"分享到社区"(会向 openwebui.com 发 POST)
+      ENABLE_COMMUNITY_SHARING: "false"
+      # —— 本地文件工具 (模型可列目录/读文件/查知识库, 全部走内网) ——
+      # 允许普通用户直接使用工具服务器(该权限默认关闭, 关闭时 tool_servers 会被丢弃)
+      USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS: "true"
+      ENABLE_API_KEYS: "true"
+      USER_PERMISSIONS_FEATURES_API_KEYS: "true"
+      TOOL_SERVER_CONNECTIONS: '[{"type":"openapi","auth_type":"none","url":"http://ace-file-tools:8010","spec_type":"url","path":"/openapi.json","info":{"id":"file-tools","name":"本地文件","description":"读取 documents 文件夹里的文件, 并检索已入库的知识"},"config":{"enable":true}}]'
+
+      # HuggingFace / torch 完全离线; 缓存目录指向可写数据卷
+      # (原指向只读挂载 /models/embedding, 离线加载需建缓存时会 PermissionError)
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /app/backend/data/cache/hf
+      HF_HOME: /app/backend/data/cache/hf
+      TORCH_HOME: /app/backend/data/cache/hf
+      # tiktoken 词表: 命中本地缓存就不会去 openaipublic.blob.core.windows.net 下载
+      TIKTOKEN_CACHE_DIR: /app/backend/data/cache/tiktoken
+      USER_AGENT: AI-ACE-LOCAL
+    volumes:
+      - ${AIACE_DATA:-..}/open-webui:/app/backend/data
+      - ../models/embedding:/models/embedding:ro
+      - ../models/whisper:/models/whisper:ro
+      # 兼容旧数据库里存的模型名 "base": faster-whisper 在 WHISPER_MODEL_DIR 下找 base/ 子目录
+      - ../models/whisper/base:/app/backend/data/cache/whisper/models/base:ro
+      - ${AIACE_DATA:-..}/documents:/documents
+      - ${AIACE_DATA:-..}/output:/output
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+
+  # ================================
+  # AI-ACE 控制中心 Dashboard (常驻)
+  # ================================
+  ace-dashboard:
+    build:
+      context: ../services/dashboard
+      dockerfile: Dockerfile
+    container_name: ace-dashboard
+    environment:
+      QDRANT_HOST: ace-qdrant
+      QDRANT_PORT: "6333"
+      PARSER_URL: http://ace-document-parser:8000
+      RAG_URL: http://ace-rag-service:8002
+      VISION_URL: http://ace-vision-service:8001
+      # 按需模型容器名
+      MODELS: qwen3-text-service:8081,vision-service-model:8083
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../system:/system:ro
+    networks:
+      - ai-private-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:9000/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  ace-gateway:
+    image: python:3.11-slim
+    container_name: ace-gateway
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "/app/gateway.py"]
+    environment:
+      MAP: "3000:open-webui:8080;9000:ace-dashboard:9000;8010:ace-file-tools:8010;8011:ace-agent:8011;8081:qwen3-text-service:8081"
+    volumes:
+      - ../services/gateway/app:/app:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8010:8010"
+      - "127.0.0.1:8011:8011"
+      - "127.0.0.1:8081:8081"
+    networks:
+      - ai-private-net
+      - ai-edge-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;s=socket.socket();s.settimeout(2);s.connect(('127.0.0.1',3000))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  ai-private-net:
+    name: ai-private-net
+    driver: bridge
+    internal: true
+  ai-edge-net:
+    name: ai-edge-net
+    driver: bridge
+    # 说明: Windows/Docker Desktop 上 internal:true 会导致宿主机端口转发失效,
+    # 使 localhost 无法访问服务, 故默认不开启 (已实测确认)。
+    # 当前联网隔离依赖: pull_policy:never + HF 离线 + 无云端 API 代码 + 无运行时下载。
+    # 若日后部署到 Linux Docker (原生 docker, 非 Docker Desktop), 可取消下一行注释
+    # 获得硬件级断网 (Linux 上 internal:true 不影响端口转发)。
+    # internal: true

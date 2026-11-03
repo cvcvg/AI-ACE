@@ -1,0 +1,371 @@
+services:
+
+  ########################################
+  # Qdrant 本地向量数据库
+  ########################################
+
+  ace-qdrant:
+
+    image: qdrant/qdrant:latest
+
+    container_name: ace-qdrant
+
+    restart: unless-stopped
+
+    volumes:
+
+      - type: bind
+        source: D:/AI-ACE/knowledge/vector_db
+        target: /qdrant/storage
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+  ########################################
+  # Qwen3-4B llama.cpp 本地推理
+  ########################################
+
+  ace-qwen3:
+
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+
+    container_name: ace-qwen3
+
+    restart: unless-stopped
+
+
+    volumes:
+
+      - type: bind
+        source: D:/AI-ACE/models/qwen3-4b
+        target: /models
+        read_only: true
+
+
+    command:
+
+      - "-m"
+      - "/models/Qwen3-4B-Q4_K_M.gguf"
+
+      - "--alias"
+      - "AI-ACE-Qwen3-4B"
+
+      - "--host"
+      - "0.0.0.0"
+
+      - "--port"
+      - "8081"
+
+      - "--n-gpu-layers"
+      - "999"
+
+      - "-c"
+      - "8192"
+
+
+    deploy:
+
+      resources:
+
+        reservations:
+
+          devices:
+
+            - driver: nvidia
+
+              count: all
+
+              capabilities:
+
+                - gpu
+
+
+
+    environment:
+
+      NVIDIA_VISIBLE_DEVICES: all
+
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+
+
+    healthcheck:
+
+      test:
+
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8081/v1/models"
+        ]
+
+      interval: 30s
+
+      timeout: 10s
+
+      retries: 10
+
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+  ########################################
+  # Open WebUI 本地AI门户
+  ########################################
+
+  ace-open-webui:
+
+
+    image: ghcr.io/open-webui/open-webui:main
+
+
+    container_name: ace-open-webui
+
+
+    restart: unless-stopped
+
+
+
+    ports:
+
+      - "127.0.0.1:3000:8080"
+
+
+
+    volumes:
+
+
+      # WebUI数据
+
+      - type: bind
+        source: D:/AI-ACE/open-webui
+        target: /app/backend/data
+
+
+
+      # 本地Embedding模型
+
+      - type: bind
+        source: D:/AI-ACE/models/embedding
+        target: /models/embedding
+        read_only: true
+
+
+
+      # 企业文档目录
+
+      - type: bind
+        source: D:/AI-ACE/documents
+        target: /documents
+
+
+
+      # AI生成输出目录
+
+      - type: bind
+        source: D:/AI-ACE/output
+        target: /output
+
+
+
+
+
+    environment:
+
+
+
+      ################################
+      # llama.cpp接口
+      ################################
+
+      OPENAI_API_BASE_URL:
+
+        http://ace-qwen3:8081/v1
+
+
+      OPENAI_API_KEY:
+
+        ace-local-key
+
+
+
+
+
+      ################################
+      # 禁止联网功能
+      ################################
+
+      ENABLE_WEB_SEARCH:
+
+        "false"
+
+
+      DO_NOT_TRACK:
+
+        "true"
+
+
+      ANONYMIZED_TELEMETRY:
+
+        "false"
+
+
+      ENABLE_TELEMETRY:
+
+        "False"
+
+
+      SCARF_NO_ANALYTICS:
+
+        "true"
+
+
+
+
+
+      ################################
+      # RAG知识库
+      ################################
+
+      ENABLE_RAG:
+
+        "true"
+
+
+      VECTOR_DB:
+
+        qdrant
+
+
+      QDRANT_URI:
+
+        http://ace-qdrant:6333
+
+
+
+
+
+      ################################
+      # 本地Embedding
+      ################################
+
+      RAG_EMBEDDING_MODEL:
+
+        /models/embedding
+
+
+      SENTENCE_TRANSFORMERS_HOME:
+
+        /models/embedding
+
+
+      HF_HOME:
+
+        /models/embedding
+
+
+      TORCH_HOME:
+
+        /models/embedding
+
+
+
+
+
+
+      ################################
+      # HuggingFace完全离线
+      ################################
+
+      HF_HUB_OFFLINE:
+
+        "1"
+
+
+      TRANSFORMERS_OFFLINE:
+
+        "1"
+
+
+      HF_DATASETS_OFFLINE:
+
+        "1"
+
+
+
+
+
+      USE_EMBEDDING_MODEL_DOCKER:
+
+        ""
+
+
+      USE_AUXILIARY_EMBEDDING_MODEL_DOCKER:
+
+        ""
+
+
+      AUXILIARY_EMBEDDING_MODEL:
+
+        ""
+
+
+
+      USER_AGENT:
+
+        AI-ACE-LOCAL
+
+
+
+
+
+    depends_on:
+
+
+      ace-qwen3:
+
+        condition: service_healthy
+
+
+
+      ace-qdrant:
+
+        condition: service_started
+
+
+
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+
+########################################
+# Docker内部隔离网络
+########################################
+
+
+networks:
+
+
+  ai-private-net:
+
+    name: ai-private-net
+
+    driver: bridge
+
+    internal: true

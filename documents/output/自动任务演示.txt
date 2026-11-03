@@ -1,0 +1,1 @@
+AI-ACE是企业级AI平台，基于Qwen3-4B大模型，采用Qdrant知识库和RTX 4060加速。

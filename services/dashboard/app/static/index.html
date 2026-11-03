@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI-ACE 控制中心</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2129;
+    --panel2: #212a34;
+    --border: #2c3642;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #3b82f6;
+    --green: #22c55e;
+    --red: #ef4444;
+    --orange: #f59e0b;
+    --gray: #6b7280;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 { font-size: 22px; font-weight: 700; }
+  header .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+  }
+  .badge.run { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge.stop { background: rgba(107,114,128,.18); color: var(--gray); }
+  .badge.load { background: rgba(245,158,11,.15); color: var(--orange); }
+  .grid-sys {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px; margin-bottom: 24px;
+  }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px;
+  }
+  .stat .label { color: var(--muted); font-size: 12px; }
+  .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; word-break: break-all; }
+  h2 { font-size: 15px; margin: 20px 0 12px; color: var(--muted); font-weight: 600; }
+  .models { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .model-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px;
+  }
+  .model-head { display: flex; align-items: center; justify-content: space-between; }
+  .model-name { font-size: 16px; font-weight: 700; }
+  .model-type { color: var(--muted); font-size: 12px; margin-left: 8px; }
+  .model-desc { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .vram { margin-top: 14px; }
+  .vram .bar { height: 8px; background: var(--panel2); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+  .vram .fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .4s; }
+  .vram .txt { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  .model-actions { display: flex; gap: 8px; margin-top: 16px; }
+  button {
+    border: 1px solid var(--border); background: var(--panel2); color: var(--text);
+    border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+    transition: all .15s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { background: transparent; border-color: var(--red); color: var(--red); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
+  th, td { text-align: left; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; background: var(--panel2); }
+  tr:last-child td { border-bottom: none; }
+  .actions-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+  .log-box {
+    background: #0a0d10; border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all;
+    max-height: 320px; overflow: auto; color: #9fb4c8;
+  }
+  .log-controls { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+  select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px;
+  }
+  input[type=text], textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 13px; width: 100%;
+    font-family: inherit;
+  }
+  textarea { resize: vertical; }
+  .doc-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .doc-row input[type=text] { flex: 1; min-width: 200px; }
+  .doc-row select { min-width: 140px; }
+  .doc-result a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px;
+    font-size: 13px; box-shadow: 0 8px 30px rgba(0,0,0,.4); display: none; max-width: 360px;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>AI-ACE 控制中心</h1>
+      <div class="sub">完全本地化企业 AI 平台 · 数据与模型全部本地运行</div>
+    </div>
+    <div>
+      <button class="primary" onclick="window.open('http://127.0.0.1:3000', '_blank')">打开聊天界面</button>
+      <button class="danger" onclick="shutdown()">关闭系统</button>
+    </div>
+  </header>
+
+  <div class="grid-sys" id="sysGrid"></div>
+
+  <h2>模型管理</h2>
+  <div class="models" id="models"></div>
+
+  <h2>知识库操作</h2>
+  <div class="actions-bar">
+    <button class="primary" onclick="loadKnowledge()">加载知识库</button>
+    <button onclick="reindex()">更新索引</button>
+  </div>
+
+  <h2>文档生成</h2>
+  <div class="doc-row">
+    <input type="text" id="docTitle" placeholder="文档标题（可选）">
+    <select id="docFormat">
+      <option value="docx">Word (.docx)</option>
+      <option value="xlsx">Excel (.xlsx)</option>
+    </select>
+    <select id="docFont">
+      <option value="宋体">宋体</option>
+      <option value="黑体">黑体</option>
+      <option value="微软雅黑">微软雅黑</option>
+    </select>
+  </div>
+  <textarea id="docContent" rows="5" placeholder="在此输入报告正文内容…"></textarea>
+  <div class="actions-bar" style="align-items:center;">
+    <button class="primary" onclick="generateDoc()">生成文档</button>
+    <span class="doc-result" id="docResult"></span>
+  </div>
+
+  <h2>服务状态</h2>
+  <table>
+    <thead><tr><th>容器</th><th>镜像</th><th>状态</th></tr></thead>
+    <tbody id="containers"></tbody>
+  </table>
+
+  <h2>日志查看</h2>
+  <div class="log-controls">
+    <select id="logTarget"></select>
+    <button onclick="fetchLogs()">查看日志</button>
+    <button onclick="refreshLogTargets()">刷新容器</button>
+  </div>
+  <div class="log-box" id="logBox">点击「查看日志」以加载容器日志…</div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._t); t._t = setTimeout(() => t.style.display = 'none', 4000);
+}
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  return r.json();
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 GB';
+  return (b / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+
+async function refreshSystem() {
+  try {
+    const s = await api('/api/system');
+    const g = s.gpu || {};
+    const grid = document.getElementById('sysGrid');
+    grid.innerHTML = `
+      <div class="stat"><div class="label">Docker 状态</div><div class="value">${s.ok ? '正常' : '异常'}</div></div>
+      <div class="stat"><div class="label">Docker 版本</div><div class="value">${s.docker_version || '-'}</div></div>
+      <div class="stat"><div class="label">CPU 核心</div><div class="value">${s.ncpu || '-'}</div></div>
+      <div class="stat"><div class="label">内存总量</div><div class="value">${fmtBytes(s.mem_total)}</div></div>
+      <div class="stat"><div class="label">GPU</div><div class="value">${g.name || 'NVIDIA GPU'}</div></div>
+      <div class="stat"><div class="label">显存总量</div><div class="value">${g.memory_total_mb ? (g.memory_total_mb / 1024).toFixed(1) + ' GB' : '-'}</div></div>
+      <div class="stat"><div class="label">运行容器</div><div class="value">${s.containers_running ?? 0} / ${s.containers_total ?? 0}</div></div>
+    `;
+  } catch (e) { console.error(e); }
+}
+
+function statusBadge(status) {
+  const cls = status === '运行' ? 'run' : (status === '加载中' ? 'load' : 'stop');
+  return `<span class="badge ${cls}">${status}</span>`;
+}
+
+async function refreshModels() {
+  try {
+    const list = await api('/api/models');
+    const box = document.getElementById('models');
+    box.innerHTML = list.map(m => {
+      const vram = m.vram;
+      let vramHtml = '<div class="vram"><div class="txt"><span>显存</span><span>未运行</span></div></div>';
+      if (vram && vram.total_mb) {
+        const pct = Math.min(100, Math.round(vram.used_mb / vram.total_mb * 100));
+        vramHtml = `
+          <div class="vram">
+            <div class="txt"><span>显存</span><span>${(vram.used_mb/1024).toFixed(1)} / ${(vram.total_mb/1024).toFixed(1)} GB</span></div>
+            <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
+          </div>`;
+      }
+      const running = m.status === '运行';
+      const stopped = m.status === '停止' || m.status === '未创建';
+      const startBtn = `<button class="primary" onclick="startModel('${m.container}')" ${running ? 'disabled' : ''}>启动模型</button>`;
+      const stopBtn = `<button onclick="stopModel('${m.container}')" ${!running && m.status !== '加载中' ? 'disabled' : ''}>停止模型</button>`;
+      return `
+        <div class="model-card">
+          <div class="model-head">
+            <div><span class="model-name">${m.display}</span><span class="model-type">${m.type}</span></div>
+            ${statusBadge(m.status)}
+          </div>
+          <div class="model-desc">${m.desc}</div>
+          ${vramHtml}
+          <div class="model-actions">${startBtn}${stopBtn}</div>
+        </div>`;
+    }).join('');
+  } catch (e) { console.error(e); }
+}
+
+async function refreshContainers() {
+  try {
+    const list = await api('/api/containers');
+    const tbody = document.getElementById('containers');
+    tbody.innerHTML = list.map(c => {
+      const cls = c.status === 'running' ? 'run' : 'stop';
+      return `<tr><td>${c.name}</td><td>${c.image}</td><td><span class="badge ${cls}">${c.status}</span></td></tr>`;
+    }).join('');
+  } catch (e) { console.error(e); }
+}
+
+async function refreshLogTargets() {
+  try {
+    const list = await api('/api/containers');
+    const sel = document.getElementById('logTarget');
+    const cur = sel.value;
+    sel.innerHTML = list.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+    if (cur) sel.value = cur;
+  } catch (e) { console.error(e); }
+}
+
+async function startModel(name) {
+  toast('正在启动 ' + name + ' …');
+  const r = await api('/api/models/' + name + '/start', { method: 'POST' });
+  toast(r.status === 'ok' ? '已发送启动指令' : ('启动失败: ' + (r.message || r.error || '')));
+  refreshModels();
+}
+
+async function stopModel(name) {
+  toast('正在停止 ' + name + ' …');
+  const r = await api('/api/models/' + name + '/stop', { method: 'POST' });
+  toast(r.status === 'ok' ? '已发送停止指令' : ('停止失败: ' + (r.message || r.error || '')));
+  refreshModels();
+}
+
+async function loadKnowledge() {
+  toast('正在加载知识库（重建索引）…');
+  const r = await api('/api/knowledge/load', { method: 'POST' });
+  toast('结果: ' + JSON.stringify(r));
+}
+
+async function reindex() {
+  toast('正在更新索引…');
+  const r = await api('/api/knowledge/reindex', { method: 'POST' });
+  toast('结果: ' + JSON.stringify(r));
+}
+
+async function generateDoc() {
+  const title = document.getElementById('docTitle').value.trim();
+  const content = document.getElementById('docContent').value.trim();
+  const format = document.getElementById('docFormat').value;
+  const font = document.getElementById('docFont').value;
+  if (!content) { toast('请填写正文内容'); return; }
+  toast('正在生成文档…');
+  const r = await api('/api/document/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, content, format, font_name: font, font_size: 12 })
+  });
+  if (r.status === 'success') {
+    document.getElementById('docResult').innerHTML =
+      `已生成 <a href="/api/document/download/${r.file}">${r.file}</a>（${r.format}）`;
+    toast('文档生成成功');
+  } else {
+    toast('生成失败: ' + (r.message || r.error || ''));
+  }
+}
+
+async function fetchLogs() {
+  const name = document.getElementById('logTarget').value;
+  if (!name) { toast('请选择容器'); return; }
+  document.getElementById('logBox').textContent = '加载中…';
+  const r = await api('/api/logs/' + name + '?tail=120');
+  document.getElementById('logBox').textContent = r.logs || '(无日志)';
+}
+
+async function shutdown() {
+  if (!confirm('确定关闭 AI-ACE 全部服务？')) return;
+  toast('正在关闭系统…');
+  await api('/api/shutdown', { method: 'POST' });
+  toast('系统已关闭');
+}
+
+function tick() {
+  refreshSystem(); refreshModels(); refreshContainers();
+}
+tick();
+setInterval(tick, 3000);
+refreshLogTargets();
+</script>
+</body>
+</html>

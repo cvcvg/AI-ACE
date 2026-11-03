@@ -1,0 +1,1 @@
+AI-ACE是企业内部AI平台，采用Qwen3-4B模型，Qdrant知识库，RTX 4060 CUDA加速。

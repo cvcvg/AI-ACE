@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# 强制安装 CPU 版 torch (精确锁定 +cpu 版本, 避免拉到 CUDA 版)
+RUN pip install --no-cache-dir --default-timeout=300 --retries 5 --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch==2.13.0+cpu"
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app .
+
+EXPOSE 8002
+
+HEALTHCHECK NONE
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]

@@ -1,0 +1,128 @@
+services:
+
+  open-webui:
+
+    image: ghcr.io/open-webui/open-webui:main
+
+    container_name: ace-open-webui
+
+    restart: unless-stopped
+
+
+    ports:
+
+      # 仅本机访问
+      - "127.0.0.1:3000:8080"
+
+
+    volumes:
+
+      # 所有用户数据、聊天记录、数据库、缓存
+      # 全部保存到 D盘
+      - D:/AI-ACE/open-webui:/app/backend/data:rw
+
+
+    environment:
+
+
+      #################################
+      # 本地 llama.cpp 模型接口
+      #################################
+
+      OPENAI_API_BASE_URL: http://ace-qwen3:8081/v1
+
+      OPENAI_API_KEY: ace-local-key
+
+
+
+      #################################
+      # 隐私保护
+      #################################
+
+      ENABLE_TELEMETRY: "False"
+
+      ANONYMIZED_TELEMETRY: "false"
+
+      DO_NOT_TRACK: "true"
+
+      SCARF_NO_ANALYTICS: "true"
+
+
+
+      #################################
+      # 完全离线模式
+      #################################
+
+      HF_HUB_OFFLINE: "1"
+
+      TRANSFORMERS_OFFLINE: "1"
+
+      HF_DATASETS_OFFLINE: "1"
+
+
+
+      #################################
+      # 禁止联网功能
+      #################################
+
+      ENABLE_WEB_SEARCH: "false"
+
+      ENABLE_RAG: "false"
+
+
+
+      #################################
+      # 禁止默认 Embedding 模型下载
+      #################################
+
+      USE_EMBEDDING_MODEL_DOCKER: ""
+
+      USE_AUXILIARY_EMBEDDING_MODEL_DOCKER: ""
+
+      RAG_EMBEDDING_MODEL: ""
+
+      AUXILIARY_EMBEDDING_MODEL: ""
+
+      RAG_RERANKING_MODEL: ""
+
+
+
+      #################################
+      # 本地缓存路径
+      #################################
+
+      HF_HOME: /app/backend/data/cache/huggingface
+
+      SENTENCE_TRANSFORMERS_HOME: /app/backend/data/cache/embedding
+
+
+
+      #################################
+      # 本机标识
+      #################################
+
+      USER_AGENT: "AI-ACE-LOCAL"
+
+
+
+      #################################
+      # 禁止匿名用户数据
+      #################################
+
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: ""
+
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+networks:
+
+
+  ai-private-net:
+
+    external: true

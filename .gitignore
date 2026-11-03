@@ -1,0 +1,9 @@
+models/
+docker-images/
+open-webui/webui.db*
+open-webui/uploads/*
+!open-webui/uploads/.gitkeep
+system/install-state.json
+system/install.log
+probe*.json
+*.tmp

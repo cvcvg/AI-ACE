@@ -1,0 +1,261 @@
+services:
+
+  ace-qdrant:
+
+    image: qdrant/qdrant:latest
+
+    container_name: ace-qdrant
+
+    restart: unless-stopped
+
+
+    ports:
+
+      - "127.0.0.1:6333:6333"
+
+
+    volumes:
+
+      - D:/AI-ACE/knowledge/vector_db:/qdrant/storage
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+
+  ace-qwen3:
+
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+
+    container_name: ace-qwen3
+
+    restart: unless-stopped
+
+
+    ports:
+
+      - "127.0.0.1:8081:8081"
+
+
+    volumes:
+
+      - D:/AI-ACE/models/qwen3-4b:/models:ro
+
+
+    command:
+
+      - "-m"
+      - "/models/Qwen3-4B-Q4_K_M.gguf"
+
+      - "--host"
+      - "0.0.0.0"
+
+      - "--port"
+      - "8081"
+
+      - "--n-gpu-layers"
+      - "999"
+
+      - "-c"
+      - "8192"
+
+
+
+    deploy:
+
+      resources:
+
+        reservations:
+
+          devices:
+
+            - driver: nvidia
+
+              count: all
+
+              capabilities:
+
+                - gpu
+
+
+
+    environment:
+
+      NVIDIA_VISIBLE_DEVICES: all
+
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+
+
+    healthcheck:
+
+      test:
+
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8081/v1/models"
+        ]
+
+      interval: 30s
+
+      timeout: 10s
+
+      retries: 10
+
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+
+
+  open-webui:
+
+
+    image: ghcr.io/open-webui/open-webui:main
+
+
+    container_name: ace-open-webui
+
+
+    restart: unless-stopped
+
+
+
+    ports:
+
+      - "127.0.0.1:3000:8080"
+
+
+
+    volumes:
+
+      - D:/AI-ACE/open-webui:/app/backend/data
+
+
+
+    environment:
+
+
+      OPENAI_API_BASE_URL:
+
+        http://ace-qwen3:8081/v1
+
+
+      OPENAI_API_KEY:
+
+        ace-local-key
+
+
+
+      ENABLE_TELEMETRY:
+
+        "False"
+
+
+      ANONYMIZED_TELEMETRY:
+
+        "false"
+
+
+      DO_NOT_TRACK:
+
+        "true"
+
+
+
+      ENABLE_WEB_SEARCH:
+
+        "false"
+
+
+
+      ENABLE_RAG:
+
+        "true"
+
+
+
+      HF_HUB_OFFLINE:
+
+        "1"
+
+
+      TRANSFORMERS_OFFLINE:
+
+        "1"
+
+
+      HF_DATASETS_OFFLINE:
+
+        "1"
+
+
+
+      USER_AGENT:
+
+        AI-ACE-LOCAL
+
+
+
+      # Qdrant知识库配置
+
+      VECTOR_DB:
+
+        qdrant
+
+
+      QDRANT_URI:
+
+        http://ace-qdrant:6333
+
+
+
+    depends_on:
+
+
+      ace-qwen3:
+
+
+        condition:
+
+          service_healthy
+
+
+      ace-qdrant:
+
+
+        condition:
+
+          service_started
+
+
+
+    networks:
+
+      - ai-private-net
+
+
+
+
+
+
+networks:
+
+
+  ai-private-net:
+
+
+    external:
+
+      true

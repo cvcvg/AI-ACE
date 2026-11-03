@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+requests
+pymupdf
+python-docx
+openpyxl
+qdrant-client
+sentence-transformers
